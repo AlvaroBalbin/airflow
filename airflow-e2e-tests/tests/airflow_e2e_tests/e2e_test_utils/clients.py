@@ -228,6 +228,13 @@ class AirflowClient:
             endpoint=endpoint,
         )
 
+    def get_event_logs(self, dag_id: str, run_id: str, task_id: str | None = None) -> list[dict]:
+        """List the audit log events of a Dag run, or of one of its tasks, oldest first."""
+        params = {"dag_id": dag_id, "run_id": run_id, "order_by": "event_log_id"}
+        if task_id is not None:
+            params["task_id"] = task_id
+        return self._make_request(method="GET", endpoint="eventLogs", params=params)["event_logs"]
+
 
 class TaskSDKClient:
     """Client for interacting with the Task SDK API."""
