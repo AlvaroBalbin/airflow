@@ -71,8 +71,8 @@ def _create_loop_iterations(dag_maker, session):
         loop = create_loop(body, max_iterations=4)
     run = dag_maker.create_dagrun()
     region = session.scalar(select(DynamicRegion).where(DynamicRegion.node_id == loop.group_id))
-    sibling_region = DynamicRegion.get_or_create(
-        dag_id=run.dag_id, run_id=run.run_id, node_id=loop.group_id, session=session
+    sibling_region = DynamicRegion(
+        dag_id=run.dag_id, run_id=run.run_id, node_id=loop.group_id, forked_from_region_id=region.id
     )
     session.add(sibling_region)
     session.flush()
