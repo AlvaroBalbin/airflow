@@ -368,6 +368,7 @@ def expected_sample_hitl_detail_dict(sample_ti: TaskInstance) -> dict[str, Any]:
             "hostname": "",
             "id": str(sample_ti.id),
             "logical_date": mock.ANY,
+            "loop_iterations": [],
             "map_index": -1,
             "region_id": "00000000-0000-0000-0000-000000000000",
             "region_index": -1,

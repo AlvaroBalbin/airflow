@@ -1504,17 +1504,25 @@ def get_task_instance_count(
     return session.scalar(select(func.count()).select_from(TI).where(*conditions)) or 0
 
 
+_MAX_PREVIOUS_TIS_SCANNED = 500
+
+
 @router.get("/previous/{dag_id}/{task_id}", status_code=status.HTTP_200_OK)
-async def get_previous_task_instance(
+def get_previous_task_instance(
     dag_id: str,
     task_id: str,
-    session: AsyncSessionDep,
+    session: SessionDep,
+    dag_bag: DagBagDep,
     logical_date: Annotated[UtcDateTime | None, Query()] = None,
     map_index: Annotated[int, Query()] = -1,
     state: Annotated[TaskInstanceState | None, Query()] = None,
+    token: TIToken = CurrentTIToken,
 ) -> PreviousTIResponse | None:
     """
-    Get the previous task instance matching the given criteria, preferring a looped task's latest pass.
+    Get the previous task instance matching the given criteria.
+
+    When the requesting task instance is of ``task_id``, the previous task instance sits at the same
+    loop position as the requester. Otherwise the latest pass of a loop task is returned.
 
     :param dag_id: DAG ID (from path)
     :param task_id: Task ID (from path)
@@ -1527,9 +1535,10 @@ async def get_previous_task_instance(
         .where(TI.working_set.is_(True))
         .join(DR, (TI.dag_id == DR.dag_id) & (TI.run_id == DR.run_id))
         .options(contains_eager(TI.dag_run).load_only(DR.logical_date))
-        .where(TI.dag_id == dag_id, TI.task_id == task_id, *build_coordinate_filters(TI, map_index=map_index))
+        .where(TI.dag_id == dag_id, TI.task_id == task_id)
         .order_by(DR.logical_date.desc(), TI.region_index.desc())
     )
+    query = query.where(*build_coordinate_filters(TI, map_index=map_index))
 
     if logical_date:
         # Find TI with logical_date BEFORE the provided date (previous)
@@ -1538,12 +1547,28 @@ async def get_previous_task_instance(
     if state:
         query = query.where(TI.state == state)
 
-    row = (await session.execute(query.limit(1))).first()
-    if row is None:
+    first = session.execute(query.limit(1)).first()
+    if first is None:
         return None
-    ti, public_index = row
+    if first[0].region_id != SENTINEL_REGION_ID:
+        resolver = TaskCoordinateResolver(dag_bag, session)
+        requester = session.get(TI, token.id)
+        iterations = (
+            resolver.loop_iterations(requester)
+            if requester is not None and (requester.dag_id, requester.task_id) == (dag_id, task_id)
+            else []
+        )
+        if iterations:
+            with contextlib.closing(
+                session.execute(query.limit(_MAX_PREVIOUS_TIS_SCANNED).execution_options(yield_per=50))
+            ) as rows:
+                first = next(
+                    (row for row in rows if _has_loop_iterations(resolver, row[0], iterations)), None
+                )
+            if first is None:
+                return None
+    ti, public_index = first
     region_id, region_index = get_public_region(ti.region_id, ti.region_index)
-
     return PreviousTIResponse(
         task_id=ti.task_id,
         dag_id=ti.dag_id,
@@ -1558,6 +1583,13 @@ async def get_previous_task_instance(
         region_index=region_index,
         duration=ti.duration,
     )
+
+
+def _has_loop_iterations(resolver: TaskCoordinateResolver, ti: TI, iterations: list[tuple[str, int]]) -> bool:
+    try:
+        return resolver.loop_iterations(ti) == iterations
+    except ValueError:
+        return False
 
 
 @router.get(
