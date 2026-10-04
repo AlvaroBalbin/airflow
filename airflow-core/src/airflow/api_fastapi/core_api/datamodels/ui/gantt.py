@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from uuid import UUID
 
 from airflow.api_fastapi.core_api.base import BaseModel
 from airflow.utils.state import TaskInstanceState
@@ -26,6 +27,10 @@ from airflow.utils.state import TaskInstanceState
 class GanttTaskInstance(BaseModel):
     """Task instance data for Gantt chart."""
 
+    id: UUID
+    region_id: UUID
+    region_index: int
+    map_index: int
     task_id: str
     task_display_name: str
     try_number: int
