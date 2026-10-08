@@ -54,7 +54,7 @@ from airflow_breeze.utils.reproducible import get_source_date_epoch, repack_dete
 from airflow_breeze.utils.run_utils import run_command
 from airflow_breeze.utils.shared_options import get_dry_run
 
-RC_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)rc(?P<rc>\d+)$")
+PRE_RELEASE_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:b|rc)(?P<pre>\d+)$")
 SVN_NUM_TRIES = 3
 SVN_OPERATION_RETRY_DELAY = 5
 
@@ -119,13 +119,24 @@ def validate_git_status():
     console_print("[success]Working directory is clean")
 
 
-def validate_version_branches_exist(version_branch, remote_name):
+def get_candidate_base_branch(version: str, version_branch: str) -> str:
+    """Return the branch the candidate is cut, tagged and constrained from.
+
+    An rc uses ``vX-Y-stable``; a beta uses ``vX-Y-test``, which exists before stable does.
+    """
+    from packaging.version import Version
+
+    pre = Version(version).pre
+    if pre and pre[0] == "rc":
+        return f"v{version_branch}-stable"
+    return f"v{version_branch}-test"
+
+
+def validate_version_branches_exist(version_branch, remote_name, candidate_base_branch):
     """Validate that the required version branches exist."""
     console_print(f"[info]Validating version branches exist for {version_branch}...")
 
-    # Check if test branch exists
     test_branch = f"v{version_branch}-test"
-    stable_branch = f"v{version_branch}-stable"
 
     # Fetch to get latest remote branches
     run_command(["git", "fetch", remote_name], check=True)
@@ -139,22 +150,16 @@ def validate_version_branches_exist(version_branch, remote_name):
     )
     remote_branches = result.stdout
 
-    test_branch_exists = f"{remote_name}/{test_branch}" in remote_branches
-    stable_branch_exists = f"{remote_name}/{stable_branch}" in remote_branches
-
-    if not test_branch_exists:
-        console_print(f"[error]Test branch '{remote_name}/{test_branch}' does not exist!")
-        console_print("Available remote branches:")
-        run_command(["git", "branch", "-r"])
-        exit(1)
-    console_print(f"[success]Test branch '{remote_name}/{test_branch}' exists")
-
-    if not stable_branch_exists:
-        console_print(f"[error]Stable branch '{remote_name}/{stable_branch}' does not exist!")
-        console_print("Available remote branches:")
-        run_command(["git", "branch", "-r"])
-        exit(1)
-    console_print(f"[success]Stable branch '{remote_name}/{stable_branch}' exists")
+    # For a beta candidate_base_branch is the test branch, so this collapses to one check.
+    candidate_base_role = "Stable branch" if candidate_base_branch.endswith("-stable") else "Test branch"
+    required_branches = {test_branch: "Test branch", candidate_base_branch: candidate_base_role}
+    for branch, role in required_branches.items():
+        if f"{remote_name}/{branch}" not in remote_branches:
+            console_print(f"[error]{role} '{remote_name}/{branch}' does not exist!")
+            console_print("Available remote branches:")
+            run_command(["git", "branch", "-r"])
+            exit(1)
+        console_print(f"[success]{role} '{remote_name}/{branch}' exists")
 
 
 def validate_tag_does_not_exist(version, remote_name):
@@ -199,11 +204,9 @@ def validate_tag_does_not_exist(version, remote_name):
         exit(1)
 
 
-def validate_on_correct_branch_for_tagging(version_branch):
-    """Validate that we're on the correct branch for tagging (stable branch)."""
+def validate_on_correct_branch_for_tagging(candidate_base_branch):
+    """Validate that we're on the correct branch for tagging (the candidate base branch)."""
     console_print("[info]Validating we're on the correct branch for tagging...")
-
-    expected_branch = f"v{version_branch}-stable"
 
     # Check current branch
     result = run_command(
@@ -214,35 +217,44 @@ def validate_on_correct_branch_for_tagging(version_branch):
     )
     current_branch = result.stdout.strip()
 
-    if current_branch != expected_branch:
-        console_print(f"[error]Currently on branch '{current_branch}', expected '{expected_branch}'!")
-        console_print("Tags should be created on the stable branch after merging the sync PR.")
+    if current_branch != candidate_base_branch:
+        console_print(f"[error]Currently on branch '{current_branch}', expected '{candidate_base_branch}'!")
+        console_print("Tags should be created on the candidate base branch after merging the sync PR.")
         console_print("Make sure the PR merge step completed successfully.")
         exit(1)
-    console_print(f"[success]On correct branch '{expected_branch}' for tagging")
+    console_print(f"[success]On correct branch '{candidate_base_branch}' for tagging")
 
 
-def merge_pr(version_branch, remote_name, sync_branch):
+def merge_pr(remote_name, sync_branch, candidate_base_branch):
     if confirm_action("Do you want to merge the Sync PR?"):
         run_command(
             [
                 "git",
                 "checkout",
-                f"v{version_branch}-stable",
+                candidate_base_branch,
             ],
             check=True,
         )
         run_command(
-            ["git", "reset", "--hard", f"{remote_name}/v{version_branch}-stable"],
+            ["git", "reset", "--hard", f"{remote_name}/{candidate_base_branch}"],
             check=True,
         )
         run_command(
             ["git", "merge", "--ff-only", f"{sync_branch}"],
             check=True,
         )
+        if not candidate_base_branch.endswith("-stable"):
+            # Beta: the merge is needed only locally so the tag can be created. Pushing the notes
+            # commit to vX-Y-test would diverge it from main and break the next fast-forward, so the
+            # push is skipped regardless of --answer / prompt habits.
+            console_print(
+                f"[info]Not pushing to {candidate_base_branch}: a beta's commit is kept local so the "
+                "next fast-forward to main is not broken."
+            )
+            return
         if confirm_action("Do you want to push the changes? Pushing the changes closes the PR"):
             run_command(
-                ["git", "push", remote_name, f"v{version_branch}-stable"],
+                ["git", "push", remote_name, candidate_base_branch],
                 check=True,
             )
 
@@ -443,10 +455,42 @@ def sign_the_release(repo_root):
         console_print("[success]Release signed")
 
 
-def generate_and_push_constraints(version, version_branch):
-    # Resolved from the stable branch the candidate was cut from, so the constraints describe the
-    # sources being voted on. The workflow reads "rcN" and allows pre-releases accordingly.
-    publish_constraints(version=version, ref=f"v{version_branch}-stable")
+def tag_constraints_from_branch_tip(version, version_branch, remote_name):
+    """Tag ``constraints-<version>`` at the ``constraints-X-Y`` branch tip.
+
+    A beta pins providers at their released versions, which that tip already holds, so there is
+    nothing new to resolve. Sync ``constraints-X-Y`` to ``constraints-main`` before cutting so the
+    tip is current.
+    """
+    constraints_branch = f"constraints-{version_branch}"
+    constraints_tag = f"constraints-{version}"
+    if not confirm_action(f"Tag {constraints_tag} at the tip of {remote_name}/{constraints_branch}?"):
+        return
+    run_command(["git", "fetch", remote_name, constraints_branch], check=True)
+    run_command(
+        [
+            "git",
+            "tag",
+            "-a",
+            constraints_tag,
+            f"{remote_name}/{constraints_branch}",
+            "-m",
+            f"Constraints for Apache Airflow {version}",
+        ],
+        check=True,
+    )
+    run_command(["git", "push", remote_name, f"refs/tags/{constraints_tag}"], check=True)
+    console_print(f"[success]Tagged {constraints_tag} at {remote_name}/{constraints_branch} tip")
+
+
+def generate_and_push_constraints(version, version_branch, candidate_base_branch, remote_name):
+    from packaging.version import Version
+
+    pre = Version(version).pre
+    if pre and pre[0] == "rc":
+        publish_constraints(version=version, ref=candidate_base_branch)
+    else:
+        tag_constraints_from_branch_tip(version, version_branch, remote_name)
 
 
 def clone_asf_repo(version, repo_root):
@@ -647,7 +691,7 @@ def remove_old_releases(version, task_sdk_version, repo_root):
         if entry.name == version:
             # Don't remove the current RC
             continue
-        if entry.is_dir() and RC_PATTERN.match(entry.name):
+        if entry.is_dir() and PRE_RELEASE_PATTERN.match(entry.name):
             old_releases.append(entry.name)
     old_releases.sort()
     console_print(f"The following old Airflow releases should be removed: {old_releases}")
@@ -669,7 +713,7 @@ def remove_old_releases(version, task_sdk_version, repo_root):
             if entry.name == task_sdk_version:
                 # Don't remove the current RC
                 continue
-            if entry.is_dir() and RC_PATTERN.match(entry.name):
+            if entry.is_dir() and PRE_RELEASE_PATTERN.match(entry.name):
                 old_task_sdk_releases.append(entry.name)
         old_task_sdk_releases.sort()
         console_print(f"The following old Task SDK releases should be removed: {old_task_sdk_releases}")
@@ -767,6 +811,7 @@ def publish_release_candidate(
     version_suffix = airflow_version.pre[0] + str(airflow_version.pre[1])
     version_branch = str(airflow_version.release[0]) + "-" + str(airflow_version.release[1])
     version_without_rc = airflow_version.base_version
+    candidate_base_branch = get_candidate_base_branch(version, version_branch)
 
     task_sdk_version_obj = Version(task_sdk_version)
     task_sdk_version_without_rc = task_sdk_version_obj.base_version
@@ -778,9 +823,13 @@ def publish_release_candidate(
         console_print("[info]Skipping validations in dry-run mode")
         validate_remote_tracks_apache_airflow(remote_name)
         validate_git_status()
-        validate_version_branches_exist(version_branch, remote_name)
+        validate_version_branches_exist(version_branch, remote_name, candidate_base_branch)
         validate_tag_does_not_exist(version, remote_name)
         validate_tag_does_not_exist(f"task-sdk/{task_sdk_version}", remote_name)
+        # A beta tags its own constraints tag directly (no workflow to replace it), so a re-run must
+        # stop here rather than fail at the tag step after the build and signing have already run.
+        if not candidate_base_branch.endswith("-stable"):
+            validate_tag_does_not_exist(f"constraints-{version}", remote_name)
 
     # List the above variables and ask for confirmation
     console_print()
@@ -789,6 +838,7 @@ def publish_release_candidate(
     console_print(f"Task SDK version: {task_sdk_version}")
     console_print(f"version_suffix: {version_suffix}")
     console_print(f"version_branch: {version_branch}")
+    console_print(f"candidate_base_branch: {candidate_base_branch}")
     console_print(f"version_without_rc: {version_without_rc}")
     console_print(f"task_sdk_version_without_rc: {task_sdk_version_without_rc}")
     console_print(f"airflow_repo_root: {airflow_repo_root}")
@@ -800,12 +850,12 @@ def publish_release_candidate(
     console_print()
     confirm_action("Verify that the above information is correct. Do you want to continue?", abort=True)
     # Merge the sync PR
-    merge_pr(version_branch, remote_name, sync_branch)
+    merge_pr(remote_name, sync_branch, candidate_base_branch)
     #
     # # Tag & clean the repo
     # Validate we're on the correct branch before tagging
     if not get_dry_run():
-        validate_on_correct_branch_for_tagging(version_branch)
+        validate_on_correct_branch_for_tagging(candidate_base_branch)
     git_tag(version, f"Apache Airflow {version}")
     git_tag(f"task-sdk/{task_sdk_version}", f"Airflow Task SDK {task_sdk_version}")
     git_clean()
@@ -829,7 +879,7 @@ def publish_release_candidate(
     # Sign the release
     sign_the_release(airflow_repo_root)
     # Generate, publish and tag the constraints for this candidate
-    generate_and_push_constraints(version, version_branch)
+    generate_and_push_constraints(version, version_branch, candidate_base_branch, remote_name)
     # Clone the asf repo
     clone_asf_repo(version, airflow_repo_root)
     # Move artifacts to SVN

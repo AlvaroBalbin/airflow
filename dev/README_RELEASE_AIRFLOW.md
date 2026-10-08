@@ -114,6 +114,30 @@ moves `vX-Y-test` forward to the current `main` - only the branch-specific commi
 `Update default branches for X.Y`) are kept on top of `main`. Each beta is cut from the branch
 in that state, so everything merged to `main` lands in the next beta.
 
+A beta (`X.Y.0bN`) is cut with the same [`start-rc-process`](#build-rc-artifacts) command as a
+release candidate, but it differs from an `rc` in three ways: there is no vote, it is cut from
+`vX-Y-test` instead of `vX-Y-stable`, and its constraints come from the `constraints-X-Y` branch tip
+rather than a fresh resolution. Because no `vX-Y-stable` branch exists yet during the beta phase,
+`start-rc-process` validates, merges and tags against `vX-Y-test` when `--version` is a beta (for an
+`rc` it uses `vX-Y-stable` as before). No stable branch is required to cut a beta; the stable branch
+is created at `X.Y.0rc1`.
+
+Constraints: a beta pins providers at their released versions from sources that match `main`, so its
+resolution is already what the shared `constraints-X-Y` branch holds. `start-rc-process` therefore
+tags `constraints-X.Y.0bN` at the `constraints-X-Y` branch tip rather than triggering the
+`release-constraints` workflow (the note under [Build RC artifacts](#build-rc-artifacts) about the
+candidate resolving its own constraints applies to an `rc` only; the workflow earns its cost for an
+`rc`, where the provider wave on PyPI must be pinned, and for a final, which commits onto
+`constraints-X-Y`). `tag_constraints_from_branch_tip` tags the tip as-is with no freshness check, so
+**before cutting the beta, refresh `constraints-X-Y`**: run the `Refresh constraints` workflow from
+`main` with `ref=vX-Y-test`, which rewrites `constraints-X-Y` from that ref's sources.
+
+A beta does not merge a sync PR into `vX-Y-test`. When `start-rc-process` prompts to merge the sync
+PR, answer **yes**: it creates the beta's version/release-notes commit locally and tags it, but does
+**not** push it (the command skips the push for a beta, because landing that commit on `vX-Y-test`
+would diverge it from `main` and break the next fast-forward). If you opened a sync PR against
+`vX-Y-test`, close it unmerged - the beta tag references the commit without it being on the branch.
+
 During this phase, all automation that would add commits directly to `vX-Y-test` must be paused -
 any such commit makes `vX-Y-test` diverge from `main` and breaks the next fast-forward. Upgrades and
 fixes land on `main` only and reach `vX-Y-test` with the next fast-forward. When you add the new

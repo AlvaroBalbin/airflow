@@ -45,6 +45,181 @@ def rc_cmd():
     return module
 
 
+@pytest.mark.parametrize(
+    ("version", "version_branch", "expected"),
+    [
+        pytest.param("3.4.0rc1", "3-4", "v3-4-stable", id="rc-uses-stable"),
+        pytest.param("3.4.0rc2", "3-4", "v3-4-stable", id="later-rc-uses-stable"),
+        pytest.param("3.4.0b1", "3-4", "v3-4-test", id="beta-uses-test"),
+    ],
+)
+def test_get_candidate_base_branch(rc_cmd, version, version_branch, expected):
+    """An rc is cut from the stable branch; a beta from the test branch."""
+    assert rc_cmd.get_candidate_base_branch(version, version_branch) == expected
+
+
+@pytest.mark.parametrize(
+    ("candidate_base_branch", "remote_branches", "should_exit"),
+    [
+        pytest.param("v3-4-test", "  origin/v3-4-test\n", False, id="beta-passes-with-test-only"),
+        pytest.param("v3-4-stable", "  origin/v3-4-test\n", True, id="rc-exits-without-stable"),
+        pytest.param(
+            "v3-4-stable", "  origin/v3-4-test\n  origin/v3-4-stable\n", False, id="rc-passes-with-both"
+        ),
+    ],
+)
+def test_validate_version_branches_exist(
+    monkeypatch, rc_cmd, candidate_base_branch, remote_branches, should_exit
+):
+    """A beta needs only the test branch; an rc still needs both test and stable."""
+    import types
+
+    def fake_run_command(cmd, **kwargs):
+        if cmd[:3] == ["git", "branch", "-r"] and kwargs.get("capture_output"):
+            return types.SimpleNamespace(stdout=remote_branches)
+        return None
+
+    monkeypatch.setattr(rc_cmd, "run_command", fake_run_command)
+    monkeypatch.setattr(rc_cmd, "console_print", lambda *a, **k: None)
+
+    if should_exit:
+        with pytest.raises(SystemExit):
+            rc_cmd.validate_version_branches_exist("3-4", "origin", candidate_base_branch)
+    else:
+        rc_cmd.validate_version_branches_exist("3-4", "origin", candidate_base_branch)
+
+
+def test_merge_pr_beta_does_not_push(monkeypatch, rc_cmd):
+    """A beta merges the notes commit locally but never pushes it to vX-Y-test."""
+    run_command_calls: list[list[str]] = []
+    monkeypatch.setattr(rc_cmd, "confirm_action", lambda *a, **k: True)
+    monkeypatch.setattr(rc_cmd, "console_print", lambda *a, **k: None)
+    monkeypatch.setattr(rc_cmd, "run_command", lambda cmd, **k: run_command_calls.append(cmd))
+
+    rc_cmd.merge_pr("origin", "sync-branch", "v3-4-test")
+
+    assert ["git", "checkout", "v3-4-test"] in run_command_calls
+    assert ["git", "merge", "--ff-only", "sync-branch"] in run_command_calls
+    assert not any(cmd[:2] == ["git", "push"] for cmd in run_command_calls)
+
+
+def test_merge_pr_rc_pushes_to_stable(monkeypatch, rc_cmd):
+    """An rc still pushes the merged sync branch to vX-Y-stable."""
+    run_command_calls: list[list[str]] = []
+    monkeypatch.setattr(rc_cmd, "confirm_action", lambda *a, **k: True)
+    monkeypatch.setattr(rc_cmd, "console_print", lambda *a, **k: None)
+    monkeypatch.setattr(rc_cmd, "run_command", lambda cmd, **k: run_command_calls.append(cmd))
+
+    rc_cmd.merge_pr("origin", "sync-branch", "v3-4-stable")
+
+    assert ["git", "push", "origin", "v3-4-stable"] in run_command_calls
+
+
+def test_generate_and_push_constraints_rc_triggers_workflow(monkeypatch, rc_cmd):
+    """An rc resolves fresh constraints via the release-constraints workflow, from the stable branch."""
+    publish_calls: list[dict] = []
+    tag_tip_calls: list[tuple] = []
+
+    monkeypatch.setattr(rc_cmd, "publish_constraints", lambda **kwargs: publish_calls.append(kwargs))
+    monkeypatch.setattr(
+        rc_cmd,
+        "tag_constraints_from_branch_tip",
+        lambda *args: tag_tip_calls.append(args),
+    )
+
+    rc_cmd.generate_and_push_constraints("3.4.0rc1", "3-4", "v3-4-stable", "origin")
+
+    assert publish_calls == [{"version": "3.4.0rc1", "ref": "v3-4-stable"}]
+    assert tag_tip_calls == []
+
+
+def test_generate_and_push_constraints_beta_tags_branch_tip(monkeypatch, rc_cmd):
+    """A beta tags the shared constraints branch tip instead of running the workflow."""
+    publish_calls: list[dict] = []
+    tag_tip_calls: list[tuple] = []
+
+    monkeypatch.setattr(rc_cmd, "publish_constraints", lambda **kwargs: publish_calls.append(kwargs))
+    monkeypatch.setattr(
+        rc_cmd,
+        "tag_constraints_from_branch_tip",
+        lambda *args: tag_tip_calls.append(args),
+    )
+
+    rc_cmd.generate_and_push_constraints("3.4.0b1", "3-4", "v3-4-test", "origin")
+
+    assert publish_calls == []
+    assert tag_tip_calls == [("3.4.0b1", "3-4", "origin")]
+
+
+@pytest.mark.parametrize(
+    ("name", "matches"),
+    [
+        pytest.param("3.4.0rc1", True, id="rc"),
+        pytest.param("3.4.0b1", True, id="beta"),
+        pytest.param("3.4.0b2", True, id="later-beta"),
+        pytest.param("3.4.0", False, id="final"),
+        pytest.param("3.4.0a1", False, id="alpha"),
+        pytest.param("not-a-release", False, id="garbage"),
+    ],
+)
+def test_pre_release_pattern_matches_rc_and_beta(rc_cmd, name, matches):
+    """Old-release cleanup collects rc and beta directories, not finals or anything else."""
+    assert bool(rc_cmd.PRE_RELEASE_PATTERN.match(name)) is matches
+
+
+def test_remove_old_releases_collects_beta_directories(monkeypatch, rc_cmd):
+    """A beta run offers to remove older beta directories, not only rc ones."""
+    version = "3.4.0b2"
+    task_sdk_version = "1.5.0b2"
+    repo_root = "/repo/root"
+
+    entries = [
+        FakeDirEntry(version, is_dir=True),  # current beta: skipped
+        FakeDirEntry("3.4.0b1", is_dir=True),  # old beta: collected
+        FakeDirEntry("3.4.0", is_dir=True),  # final: excluded
+    ]
+    console_messages: list[str] = []
+
+    def fake_confirm_action(prompt: str, **_kwargs) -> bool:
+        return prompt == "Do you want to look for old RCs to remove?"
+
+    monkeypatch.setattr(rc_cmd.os, "chdir", lambda path: None)
+    monkeypatch.setattr(rc_cmd.os, "scandir", lambda: iter(entries))
+    monkeypatch.setattr(rc_cmd.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(rc_cmd, "confirm_action", fake_confirm_action)
+    monkeypatch.setattr(rc_cmd, "console_print", lambda msg="": console_messages.append(str(msg)))
+    monkeypatch.setattr(rc_cmd, "run_command", lambda *a, **k: None)
+
+    rc_cmd.remove_old_releases(version=version, task_sdk_version=task_sdk_version, repo_root=repo_root)
+
+    assert "The following old Airflow releases should be removed: ['3.4.0b1']" in console_messages
+
+
+def test_tag_constraints_from_branch_tip_fetches_tags_and_pushes(monkeypatch, rc_cmd):
+    """Tags constraints-<version> at the remote constraints-X-Y tip and pushes the tag."""
+    run_command_calls: list[list[str]] = []
+
+    monkeypatch.setattr(rc_cmd, "confirm_action", lambda *a, **k: True)
+    monkeypatch.setattr(rc_cmd, "console_print", lambda *a, **k: None)
+    monkeypatch.setattr(rc_cmd, "run_command", lambda cmd, **k: run_command_calls.append(cmd))
+
+    rc_cmd.tag_constraints_from_branch_tip("3.4.0b1", "3-4", "origin")
+
+    assert run_command_calls == [
+        ["git", "fetch", "origin", "constraints-3-4"],
+        [
+            "git",
+            "tag",
+            "-a",
+            "constraints-3.4.0b1",
+            "origin/constraints-3-4",
+            "-m",
+            "Constraints for Apache Airflow 3.4.0b1",
+        ],
+        ["git", "push", "origin", "refs/tags/constraints-3.4.0b1"],
+    ]
+
+
 def test_clone_asf_repo(monkeypatch, rc_cmd):
     """Test that clone_asf_repo behaves correctly based on CI environment."""
     version = "2.10.0rc3"
@@ -148,7 +323,7 @@ def test_remove_old_releases_only_collects_rc_directories(monkeypatch, rc_cmd):
     # Act
     rc_cmd.remove_old_releases(version=version, task_sdk_version=task_sdk_version, repo_root=repo_root)
 
-    # Assert: only directory entries matching RC_PATTERN, excluding current version, and sorted.
+    # Assert: only directory entries matching PRE_RELEASE_PATTERN, excluding current version, and sorted.
     assert f"{repo_root}/asf-dist/dev/airflow" in chdir_calls
     assert repo_root in chdir_calls
     assert (
